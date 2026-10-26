@@ -1,5 +1,5 @@
 import torch, torch.nn as nn, torch.nn.functional as F
-import ai_edge_torch
+import litert_torch as ai_edge_torch
 
 class RMSNorm(nn.Module):
     def __init__(self, d):
