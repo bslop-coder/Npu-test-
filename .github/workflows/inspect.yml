@@ -1,0 +1,16 @@
+name: inspect-anima
+on: workflow_dispatch
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install huggingface_hub requests
+      - run: python inspect_anima.py | tee anima_tensors.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anima-tensors
+          path: anima_tensors.txt
