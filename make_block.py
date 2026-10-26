@@ -29,6 +29,15 @@ class Block(nn.Module):
         x = x + self.o(a.transpose(1, 2).reshape(B, N, D))
         return x + self.down(F.gelu(self.up(self.n2(x))))
 
-m = Block().eval()
-ex = (torch.randn(1, 1024, 2048), torch.randn(1, 1, 2048))
-ai_edge_torch.convert(m, ex).export("block.tflite")
+class Lin(nn.Module):
+    def __init__(self, d=2048, m=8192):
+        super().__init__()
+        self.a = nn.Linear(d, m)
+        self.b = nn.Linear(m, d)
+    def forward(self, x):
+        return self.b(F.relu(self.a(x)))
+
+x = torch.randn(1, 256, 2048)
+t = torch.randn(1, 1, 2048)
+ai_edge_torch.convert(Lin().eval(), (x,)).export("lin.tflite")
+ai_edge_torch.convert(Block().eval(), (x, t)).export("block256.tflite")
