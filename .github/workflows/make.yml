@@ -8,7 +8,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      -       - run: pip install litert-torch
+      - run: pip install litert-torch
       - run: python make_block.py
       - uses: actions/upload-artifact@v4
         with:
