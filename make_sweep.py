@@ -21,3 +21,14 @@ make(256, 2048, 8192)
 make(1024, 2048, 2048)
 make(64, 2048, 8192)
 make(256, 512, 2048)
+def make_f32(tokens, din, dout):
+    m = tf.keras.Sequential([
+        tf.keras.layers.InputLayer(batch_input_shape=(tokens, din)),
+        tf.keras.layers.Dense(dout),
+    ])
+    c = tf.lite.TFLiteConverter.from_keras_model(m)
+    open("f32_%d_%d_%d.tflite" % (tokens, din, dout), "wb").write(c.convert())
+
+make_f32(256, 2048, 2048)
+make_f32(1024, 2048, 2048)
+make_f32(256, 2048, 8192)
