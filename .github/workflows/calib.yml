@@ -14,7 +14,14 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release -j4
           ls build/bin
+      - name: restore models
+        id: mc
+        uses: actions/cache/restore@v4
+        with:
+          path: models
+          key: anima-models-v1
       - name: download models
+        if: steps.mc.outputs.cache-hit != 'true'
         run: |
           mkdir -p models
           B=https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files
@@ -22,11 +29,26 @@ jobs:
           curl -L --fail -o models/llm.safetensors $B/text_encoders/qwen_3_06b_base.safetensors
           curl -L --fail -o models/vae.safetensors $B/vae/qwen_image_vae.safetensors
           ls -la models
-          df -h /
+      - name: save models
+        if: steps.mc.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: models
+          key: anima-models-v1
       - name: generate and collect
         run: |
-          ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, long hair, school uniform, smile, outdoors, cherry blossoms" --steps 8 --cfg-scale 1.0 -W 512 -H 512 --seed 1 -t 4 --type f16 --imatrix-out imatrix.dat -o out.png -v > run.log 2>&1 || true
-          tail -n 60 run.log
+          n=0
+          for F in --imat-out --imatrix-out; do
+            n=$((n+1))
+            ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, long hair, school uniform, smile, outdoors, cherry blossoms" --steps 8 --cfg-scale 1.0 -W 512 -H 512 --seed 1 -t 4 --type q8_0 $F imatrix.dat -o out.png -v > run$n.log 2>&1 || true
+            echo "---- ATTEMPT $n with $F, first 12 lines"
+            head -n 12 run$n.log
+            echo "---- ATTEMPT $n last 25 lines"
+            tail -n 25 run$n.log
+            if [ -f imatrix.dat ]; then break; fi
+          done
+          echo "---- imatrix flag names in cli main.cpp"
+          grep -n -i "imat" sd/examples/cli/main.cpp | head -20
           test -f imatrix.dat
       - name: analyze
         run: |
@@ -74,4 +96,5 @@ jobs:
           path: |
             imatrix.dat
             out.png
-            run.log
+            run1.log
+            run2.log
