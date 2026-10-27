@@ -1,0 +1,16 @@
+name: show-sd
+on: workflow_dispatch
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - name: print function
+        run: |
+          git clone https://github.com/leejet/stable-diffusion.cpp sd
+          cd sd
+          git checkout 0886f11b6b8b4d1f6259e0f1337cae554284c37a
+          F=$(find . -name ggml_extend.hpp | head -1)
+          echo FILE $F
+          grep -n "ggml_backend_graph_compute\|ggml_backend_sched" $F
+          L=$(grep -n "ggml_backend_graph_compute" $F | head -1 | cut -d: -f1)
+          sed -n "$((L-70)),$((L+30))p" $F
