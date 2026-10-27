@@ -14,8 +14,10 @@ jobs:
           java-version: "17"
       - run: pip install "tensorflow==2.15.0" "numpy<2"
       - run: python make_sweep.py
+      - run: python make_attn.py
       - run: mkdir -p app/src/main/assets
       - run: cp fc_256_2048_2048.tflite fc_1024_2048_2048.tflite fc_256_2048_8192.tflite app/src/main/assets/
+      - run: cp attn_f32.tflite sm_int8.tflite qk_int8.tflite pv_int8.tflite app/src/main/assets/
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
