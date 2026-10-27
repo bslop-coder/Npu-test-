@@ -9,13 +9,13 @@ jobs:
           git clone https://github.com/leejet/stable-diffusion.cpp sd
           cd sd
           git checkout 0886f11b6b8b4d1f6259e0f1337cae554284c37a
-          echo ---- RUNNER 705-790
-          sed -n '705,790p' src/core/ggml_runner.cpp || true
-          echo ---- WORKSPACE 38-110
-          sed -n '38,110p' src/core/compute_workspace.cpp || true
-          echo ---- WORKSPACE HEADER 15-60
-          sed -n '15,60p' src/core/compute_workspace.h || true
-          echo ---- LINEAR
-          grep -n "ggml_mul_mat\|ggml_ext_linear" src/core/ggml_extend.h src/core/ggml_extend.cpp | head -30 || true
-          echo ---- ANIMA
-          grep -n "struct \|class \|Linear\|forward" src/model/diffusion/anima.hpp | head -60 || true
+          echo ---- CALLBACK USES
+          grep -rn "eval_callback" src include examples | head -40 || true
+          echo ---- BACKEND 600-680
+          sed -n '600,680p' src/core/ggml_extend_backend.cpp || true
+          echo ---- LINEAR 205-245
+          sed -n '205,245p' src/core/ggml_extend.cpp || true
+          echo ---- ANIMA DOC
+          cat docs/anima.md | head -80 || true
+          echo ---- CLI FLAGS
+          grep -n -e "--llm" -e "--diffusion-model" -e "--vae" -e "--cfg-scale" -e "--steps" -e "--diffusion-fa" -e "--offload" -e "--seed" examples/common/common.cpp | head -40 || true
