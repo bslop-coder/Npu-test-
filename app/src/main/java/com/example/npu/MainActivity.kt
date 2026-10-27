@@ -17,9 +17,9 @@ import java.nio.ByteOrder
 class MainActivity : Activity() {
     private lateinit var out: TextView
     private val npuModels = listOf("fc_256_2048_2048", "fc_1024_2048_2048", "fc_256_2048_8192")
-    private val gpuModels = listOf(
-        "attn_f32", "sm_int8", "qk_int8", "pv_int8",
-        "fc_256_2048_2048", "fc_1024_2048_2048", "fc_256_2048_8192"
+        private val gpuModels = listOf(
+        "f32_256_2048_2048", "f32_1024_2048_2048", "f32_256_2048_8192",
+        "attn_f32"
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
