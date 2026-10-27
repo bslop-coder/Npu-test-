@@ -9,13 +9,11 @@ jobs:
           git clone https://github.com/leejet/stable-diffusion.cpp sd
           cd sd
           git checkout 0886f11b6b8b4d1f6259e0f1337cae554284c37a
-          echo ---- CALLBACK USES
-          grep -rn "eval_callback" src include examples | head -40 || true
-          echo ---- BACKEND 600-680
-          sed -n '600,680p' src/core/ggml_extend_backend.cpp || true
-          echo ---- LINEAR 205-245
-          sed -n '205,245p' src/core/ggml_extend.cpp || true
-          echo ---- ANIMA DOC
-          cat docs/anima.md | head -80 || true
-          echo ---- CLI FLAGS
-          grep -n -e "--llm" -e "--diffusion-model" -e "--vae" -e "--cfg-scale" -e "--steps" -e "--diffusion-fa" -e "--offload" -e "--seed" examples/common/common.cpp | head -40 || true
+          echo ---- IMATRIX CPP
+          sed -n '1,280p' src/runtime/imatrix.cpp || true
+          echo ---- IMATRIX HEADER
+          cat src/runtime/imatrix.h || true
+          echo ---- IMATRIX MENTIONS
+          grep -rn "imatrix" examples include CMakeLists.txt src --include=*.cpp --include=*.h --include=*.txt | grep -v "^src/runtime/imatrix.cpp" | head -30 || true
+          echo ---- TYPE AND THREAD FLAGS
+          grep -n -e '"--type"' -e '"--threads"' -e '"-t"' -e '"--output"' -e '"-W"' -e '"-H"' -e '"--width"' -e '"--height"' examples/common/common.cpp | head -20 || true
