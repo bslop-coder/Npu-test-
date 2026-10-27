@@ -9,8 +9,11 @@ jobs:
           git clone https://github.com/leejet/stable-diffusion.cpp sd
           cd sd
           git checkout 0886f11b6b8b4d1f6259e0f1337cae554284c37a
-          F=$(find . -name ggml_extend.hpp | head -1)
-          echo FILE $F
-          grep -n "ggml_backend_graph_compute\|ggml_backend_sched" $F
-          L=$(grep -n "ggml_backend_graph_compute" $F | head -1 | cut -d: -f1)
-          sed -n "$((L-70)),$((L+30))p" $F
+          echo ---- FILES
+          find . -path ./.git -prune -o -type f \( -name "*.hpp" -o -name "*.h" -o -name "*.cpp" \) -print | grep -v "^./ggml/" | sort | head -100
+          echo ---- HITS
+          grep -rn "ggml_backend_graph_compute\|ggml_backend_sched" --include=*.hpp --include=*.h --include=*.cpp . | grep -v "^./ggml/" | head -40 || true
+          F=$(grep -rl "ggml_backend_graph_compute" --include=*.hpp --include=*.h --include=*.cpp . | grep -v "^./ggml/" | head -1 || true)
+          echo ---- FUNCTION IN $F
+          L=$(grep -n "ggml_backend_graph_compute" "$F" | head -1 | cut -d: -f1 || true)
+          sed -n "$((L-70)),$((L+30))p" "$F" || true
