@@ -1,0 +1,77 @@
+name: calib
+on: workflow_dispatch
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: build sd.cpp
+        run: |
+          git clone https://github.com/leejet/stable-diffusion.cpp sd
+          cd sd
+          git checkout 0886f11b6b8b4d1f6259e0f1337cae554284c37a
+          git submodule update --init --recursive
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j4
+          ls build/bin
+      - name: download models
+        run: |
+          mkdir -p models
+          B=https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files
+          curl -L --fail -o models/dit.safetensors $B/diffusion_models/anima-turbo-v1.1.safetensors
+          curl -L --fail -o models/llm.safetensors $B/text_encoders/qwen_3_06b_base.safetensors
+          curl -L --fail -o models/vae.safetensors $B/vae/qwen_image_vae.safetensors
+          ls -la models
+          df -h /
+      - name: generate and collect
+        run: |
+          ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, long hair, school uniform, smile, outdoors, cherry blossoms" --steps 8 --cfg-scale 1.0 -W 512 -H 512 --seed 1 -t 4 --type f16 --imatrix-out imatrix.dat -o out.png -v > run.log 2>&1 || true
+          tail -n 60 run.log
+          test -f imatrix.dat
+      - name: analyze
+        run: |
+          python3 - <<'EOF'
+          import re, struct, math
+          import statistics as st
+          b = open('imatrix.dat', 'rb').read()
+          o = 0
+          n = struct.unpack_from('i', b, o)[0]
+          o += 4
+          rows = []
+          for _ in range(n):
+              L = struct.unpack_from('i', b, o)[0]
+              o += 4
+              name = b[o:o + L].decode()
+              o += L
+              nc = struct.unpack_from('i', b, o)[0]
+              o += 4
+              nv = struct.unpack_from('i', b, o)[0]
+              o += 4
+              v = struct.unpack_from('%df' % nv, b, o)
+              o += 4 * nv
+              ms = [x / max(nc, 1) for x in v]
+              rms = [math.sqrt(max(x, 0.0)) for x in ms]
+              tot = math.sqrt(sum(ms) / len(ms))
+              med = st.median(rms)
+              ratio = max(rms) / max(med, 1e-9)
+              rows.append((name, nc, nv, tot, max(rms), med, ratio))
+          print('ENTRIES', len(rows))
+          print('--- WORST 40 BY OUTLIER RATIO (name | calls | channels | rms | max_ch_rms | median_ch_rms | ratio)')
+          for r in sorted(rows, key=lambda r: -r[6])[:40]:
+              print('%s | %d | %d | %.4f | %.3f | %.4f | %.1f' % r)
+          print('--- GROUPED BY LAYER TYPE (type | count | median ratio | max ratio | median rms)')
+          g = {}
+          for r in rows:
+              g.setdefault(re.sub(r'\.\d+(?=\.|$)', '.N', r[0]), []).append(r)
+          for k in sorted(g):
+              rs = g[k]
+              print('%s | %d | %.1f | %.1f | %.4f' % (k, len(rs), st.median([x[6] for x in rs]), max(x[6] for x in rs), st.median([x[3] for x in rs])))
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: calib
+          path: |
+            imatrix.dat
+            out.png
+            run.log
