@@ -1,0 +1,363 @@
+name: quanttest2
+on: workflow_dispatch
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: build patched sd.cpp
+        run: |
+          git clone https://github.com/leejet/stable-diffusion.cpp sd
+          cd sd
+          git checkout 0886f11b6b8b4d1f6259e0f1337cae554284c37a
+          git submodule update --init --recursive
+          cd ..
+          python3 - <<'EOF'
+          HEAD = '#include <algorithm>\n#include <cmath>\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <fstream>\n#include <sstream>\n#include <string>\n#include <unordered_map>\n#include <vector>\n'
+          HELPERS = r'''
+          struct SdFakeQ {
+              int smooth         = 0;
+              int mode           = 0;
+              float amax_static  = 0.f;
+              std::string name;
+              std::vector<float> s;
+          };
+          static int g_fakeq_calls    = 0;
+          static int g_fakeq_smoothed = 0;
+          static int g_fakeq_static   = 0;
+          static std::unordered_map<std::string, float>& sd_amax_rec() {
+              static auto* m = new std::unordered_map<std::string, float>();
+              return *m;
+          }
+          struct SdFakeQReport {
+              ~SdFakeQReport() {
+                  if (g_fakeq_calls > 0) {
+                      fprintf(stderr, "[fakeq] patched linear calls: %d, smoothed: %d, static: %d\n", g_fakeq_calls, g_fakeq_smoothed, g_fakeq_static);
+                  }
+                  const char* out = getenv("SD_AMAX_OUT");
+                  if (out != nullptr && !sd_amax_rec().empty()) {
+                      FILE* f = fopen(out, "w");
+                      if (f != nullptr) {
+                          for (auto& kv : sd_amax_rec()) {
+                              fprintf(f, "%s\t%.9g\n", kv.first.c_str(), kv.second);
+                          }
+                          fclose(f);
+                          fprintf(stderr, "[fakeq] wrote %d amax entries\n", (int)sd_amax_rec().size());
+                      }
+                  }
+              }
+          };
+          static SdFakeQReport g_sd_fakeq_report;
+
+          static void sd_fakeq_op(struct ggml_tensor* dst, const struct ggml_tensor* a, int ith, int nth, void* ud) {
+              (void)nth;
+              if (ith != 0) {
+                  return;
+              }
+              static const float clip = getenv("SD_CLIP") != nullptr ? (float)atof(getenv("SD_CLIP")) : 1.0f;
+              const SdFakeQ* q = (const SdFakeQ*)ud;
+              const int64_t n0 = a->ne[0];
+              const int64_t n1 = a->ne[1];
+              const int64_t n2 = a->ne[2];
+              const int64_t n3 = a->ne[3];
+              const bool sm    = q->smooth != 0 && (int64_t)q->s.size() == n0;
+              float amax       = 0.f;
+              for (int64_t i3 = 0; i3 < n3; i3++) {
+                  for (int64_t i2 = 0; i2 < n2; i2++) {
+                      for (int64_t i1 = 0; i1 < n1; i1++) {
+                          for (int64_t i0 = 0; i0 < n0; i0++) {
+                              float v = *(const float*)((const char*)a->data + i0 * a->nb[0] + i1 * a->nb[1] + i2 * a->nb[2] + i3 * a->nb[3]);
+                              if (!std::isfinite(v)) {
+                                  continue;
+                              }
+                              if (sm) {
+                                  v /= q->s[i0];
+                              }
+                              amax = std::max(amax, std::fabs(v));
+                          }
+                      }
+                  }
+              }
+              const bool record = q->mode == 1;
+              if (record) {
+                  float& cur = sd_amax_rec()[q->name];
+                  cur        = std::max(cur, amax);
+              }
+              if (q->mode == 2 && q->amax_static > 0.f) {
+                  amax = q->amax_static * clip;
+              }
+              const float scale = amax > 0.f ? amax / 127.f : 1.f;
+              for (int64_t i3 = 0; i3 < n3; i3++) {
+                  for (int64_t i2 = 0; i2 < n2; i2++) {
+                      for (int64_t i1 = 0; i1 < n1; i1++) {
+                          for (int64_t i0 = 0; i0 < n0; i0++) {
+                              float v = *(const float*)((const char*)a->data + i0 * a->nb[0] + i1 * a->nb[1] + i2 * a->nb[2] + i3 * a->nb[3]);
+                              float o = v;
+                              if (!record && std::isfinite(v)) {
+                                  float t = sm ? v / q->s[i0] : v;
+                                  t       = std::nearbyint(t / scale);
+                                  t       = std::min(127.f, std::max(-127.f, t));
+                                  o       = t * scale;
+                                  if (sm) {
+                                      o *= q->s[i0];
+                                  }
+                              }
+                              *(float*)((char*)dst->data + i0 * dst->nb[0] + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]) = o;
+                          }
+                      }
+                  }
+              }
+          }
+
+          static std::unordered_map<std::string, std::vector<float>>& sd_smooth_map() {
+              static auto* m   = new std::unordered_map<std::string, std::vector<float>>();
+              static bool loaded = false;
+              if (!loaded) {
+                  loaded        = true;
+                  const char* p = getenv("SD_SMOOTH");
+                  if (p != nullptr) {
+                      std::ifstream f(p);
+                      std::string line;
+                      while (std::getline(f, line)) {
+                          size_t t1 = line.find('\t');
+                          if (t1 == std::string::npos) {
+                              continue;
+                          }
+                          size_t t2 = line.find('\t', t1 + 1);
+                          if (t2 == std::string::npos) {
+                              continue;
+                          }
+                          std::string name = line.substr(0, t1);
+                          std::istringstream is(line.substr(t2 + 1));
+                          std::vector<float> v;
+                          float x;
+                          while (is >> x) {
+                              v.push_back(x);
+                          }
+                          (*m)[name] = v;
+                      }
+                      fprintf(stderr, "[fakeq] loaded smoothing for %d layers\n", (int)m->size());
+                  }
+              }
+              return *m;
+          }
+
+          static std::unordered_map<std::string, float>& sd_amax_in_map() {
+              static auto* m   = new std::unordered_map<std::string, float>();
+              static bool loaded = false;
+              if (!loaded) {
+                  loaded        = true;
+                  const char* p = getenv("SD_AMAX_IN");
+                  if (p != nullptr) {
+                      std::ifstream f(p);
+                      std::string line;
+                      while (std::getline(f, line)) {
+                          size_t t1 = line.find('\t');
+                          if (t1 == std::string::npos) {
+                              continue;
+                          }
+                          (*m)[line.substr(0, t1)] = (float)atof(line.c_str() + t1 + 1);
+                      }
+                      fprintf(stderr, "[fakeq] loaded static amax for %d layers\n", (int)m->size());
+                  }
+              }
+              return *m;
+          }
+
+          static ggml_tensor* sd_maybe_fakeq(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w) {
+              static const char* mode = getenv("SD_FAKEQ");
+              if (mode == nullptr || w == nullptr || x->type != GGML_TYPE_F32) {
+                  return x;
+              }
+              const char* nm = w->name;
+              if (strstr(nm, "diffusion_model.net.blocks.") == nullptr || strstr(nm, "adaln") != nullptr) {
+                  return x;
+              }
+              if (strstr(nm, "self_attn.") == nullptr && strstr(nm, "cross_attn.") == nullptr && strstr(nm, ".mlp.layer") == nullptr) {
+                  return x;
+              }
+              SdFakeQ* q = new SdFakeQ();
+              q->name    = std::string(nm);
+              if (strcmp(mode, "naive") != 0) {
+                  auto& m = sd_smooth_map();
+                  auto it = m.find(q->name);
+                  if (it != m.end()) {
+                      q->s      = it->second;
+                      q->smooth = 1;
+                      g_fakeq_smoothed++;
+                  }
+              }
+              if (strcmp(mode, "record") == 0) {
+                  q->mode = 1;
+              }
+              if (strcmp(mode, "static") == 0) {
+                  auto& am = sd_amax_in_map();
+                  auto it2 = am.find(q->name);
+                  if (it2 != am.end()) {
+                      q->amax_static = it2->second;
+                      q->mode        = 2;
+                      g_fakeq_static++;
+                  }
+              }
+              g_fakeq_calls++;
+              if (g_fakeq_calls <= 3) {
+                  fprintf(stderr, "[fakeq] mode %s on %s smooth=%d mode=%d\n", mode, nm, q->smooth, q->mode);
+              }
+              return ggml_map_custom1(ctx, x, sd_fakeq_op, 1, q);
+          }
+
+          '''
+          p = 'sd/src/core/ggml_extend.cpp'
+          s = open(p).read()
+          a1 = 'ggml_tensor* ggml_ext_linear(ggml_context* ctx,'
+          assert s.count(a1) == 1, 'anchor1 count %d' % s.count(a1)
+          s = s.replace(a1, HELPERS + a1)
+          a2 = '    if (x->ne[2] * x->ne[3] > 1024) {\n        // workaround: avoid ggml cuda error'
+          assert s.count(a2) == 1, 'anchor2 count %d' % s.count(a2)
+          s = s.replace(a2, '    x = sd_maybe_fakeq(ctx, x, w);\n' + a2)
+          open(p, 'w').write(HEAD + s)
+          print('patched ok')
+          EOF
+          cd sd
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j4
+          ls build/bin
+      - name: restore models
+        id: mc
+        uses: actions/cache/restore@v4
+        with:
+          path: models
+          key: anima-models-v1
+      - name: download models if missing
+        if: steps.mc.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          B=https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files
+          curl -L --fail -o models/dit.safetensors $B/diffusion_models/anima-turbo-v1.1.safetensors
+          curl -L --fail -o models/llm.safetensors $B/text_encoders/qwen_3_06b_base.safetensors
+          curl -L --fail -o models/vae.safetensors $B/vae/qwen_image_vae.safetensors
+          ls -la models
+      - name: base on prompt A with imatrix
+        run: |
+          ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, long hair, school uniform, smile, outdoors, cherry blossoms" --steps 8 --cfg-scale 1.0 -W 512 -H 512 --seed 1 -t 4 --type q8_0 --imat-out imatrix.dat -o out_A_base.png > A_base.log 2>&1 || true
+          tail -n 3 A_base.log
+          test -f imatrix.dat
+      - name: make smoothing factors
+        run: |
+          python3 - <<'EOF'
+          import struct, math
+          import statistics as st
+          b = open('imatrix.dat', 'rb').read()
+          o = 0
+          n = struct.unpack_from('i', b, o)[0]
+          o += 4
+          out = open('smooth.txt', 'w')
+          cnt = 0
+          for _ in range(n):
+              L = struct.unpack_from('i', b, o)[0]
+              o += 4
+              name = b[o:o + L].decode()
+              o += L
+              nc = struct.unpack_from('i', b, o)[0]
+              o += 4
+              nv = struct.unpack_from('i', b, o)[0]
+              o += 4
+              v = struct.unpack_from('%df' % nv, b, o)
+              o += 4 * nv
+              if not name.startswith('model.diffusion_model.net.blocks.'):
+                  continue
+              rms = [math.sqrt(max(x / max(nc, 1), 0.0)) for x in v]
+              med = st.median(rms)
+              s = [min(max(math.sqrt(max(r, 1e-6) / max(med, 1e-6)), 0.05), 20.0) for r in rms]
+              out.write(name + '\t' + str(nv) + '\t' + ' '.join('%.5g' % x for x in s) + '\n')
+              cnt += 1
+          out.close()
+          print('smoothing layers written', cnt)
+          EOF
+      - name: record static ranges on prompt A
+        run: |
+          SD_FAKEQ=record SD_SMOOTH=smooth.txt SD_AMAX_OUT=amax.txt ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, long hair, school uniform, smile, outdoors, cherry blossoms" --steps 8 --cfg-scale 1.0 -W 512 -H 512 --seed 1 -t 4 --type q8_0 -o out_A_record.png > A_record.log 2>&1 || true
+          grep -a "fakeq" A_record.log | head -10
+          wc -l amax.txt
+          test -s amax.txt
+      - name: base on prompt B
+        run: |
+          ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, silver hair, red eyes, kimono, night, paper lanterns, festival" --steps 8 --cfg-scale 1.0 -W 512 -H 512 --seed 2 -t 4 --type q8_0 -o out_B_base.png > B_base.log 2>&1 || true
+          tail -n 3 B_base.log
+          test -f out_B_base.png
+      - name: static scales on prompt B
+        run: |
+          SD_FAKEQ=static SD_SMOOTH=smooth.txt SD_AMAX_IN=amax.txt ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, silver hair, red eyes, kimono, night, paper lanterns, festival" --steps 8 --cfg-scale 1.0 -W 512 -H 512 --seed 2 -t 4 --type q8_0 -o out_B_static.png > B_static.log 2>&1 || true
+          grep -a "fakeq" B_static.log | head -10
+          tail -n 3 B_static.log
+          test -f out_B_static.png
+      - name: make int8 per-channel weights
+        run: |
+          df -h /
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install safetensors
+          python3 - <<'EOF'
+          import torch
+          from safetensors import safe_open
+          from safetensors.torch import save_file
+          sm = {}
+          for line in open('smooth.txt'):
+              name, n, vals = line.rstrip('\n').split('\t')
+              sm[name[name.index('blocks.'):]] = torch.tensor([float(x) for x in vals.split()])
+          out = {}
+          cnt = 0
+          with safe_open('models/dit.safetensors', 'pt') as f:
+              for key in f.keys():
+                  t = f.get_tensor(key)
+                  k = key[key.index('blocks.'):] if 'blocks.' in key else None
+                  if k in sm and t.ndim == 2 and t.shape[1] == sm[k].numel() and 'adaln' not in key and 'llm_adapter' not in key:
+                      s = sm[k].to(torch.float32)
+                      w = t.to(torch.float32) * s[None, :]
+                      sc = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / 127.0
+                      q = torch.round(w / sc).clamp(-127, 127)
+                      out[key] = ((q * sc) / s[None, :]).to(torch.float16)
+                      cnt += 1
+                  else:
+                      out[key] = t
+          save_file(out, 'models/dit_fq.safetensors')
+          print('fake-quantized layers', cnt)
+          EOF
+          ls -la models
+      - name: full w8a8 on prompt B
+        run: |
+          SD_FAKEQ=static SD_SMOOTH=smooth.txt SD_AMAX_IN=amax.txt ./sd/build/bin/sd-cli --diffusion-model models/dit_fq.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, silver hair, red eyes, kimono, night, paper lanterns, festival" --steps 8 --cfg-scale 1.0 -W 512 -H 512 --seed 2 -t 4 --type f16 -o out_B_w8a8.png > B_w8a8.log 2>&1 || true
+          grep -a "fakeq" B_w8a8.log | head -10
+          tail -n 3 B_w8a8.log
+          test -f out_B_w8a8.png
+      - name: compare
+        run: |
+          pip install pillow numpy
+          python3 - <<'EOF'
+          from PIL import Image
+          import numpy as np
+          a = np.asarray(Image.open('out_B_base.png').convert('RGB')).astype(np.float32)
+          for n in ['static', 'w8a8']:
+              b = np.asarray(Image.open('out_B_%s.png' % n).convert('RGB')).astype(np.float32)
+              mse = ((a - b) ** 2).mean()
+              print(n, 'mean abs diff %.2f' % np.abs(a - b).mean(), 'PSNR %.2f dB' % (10 * np.log10(255.0 ** 2 / max(mse, 1e-9))))
+          ims = [Image.open(f).convert('RGB') for f in ['out_B_base.png', 'out_B_static.png', 'out_B_w8a8.png']]
+          w, h = ims[0].size
+          m = Image.new('RGB', (w * 3, h))
+          for i, im in enumerate(ims):
+              m.paste(im, (i * w, 0))
+          m.save('montage2.png')
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quant2
+          path: |
+            out_B_base.png
+            out_B_static.png
+            out_B_w8a8.png
+            montage2.png
+            amax.txt
+            smooth.txt
+            A_record.log
+            B_static.log
+            B_w8a8.log
