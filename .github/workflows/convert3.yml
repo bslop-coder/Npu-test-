@@ -1,0 +1,412 @@
+name: convert3
+on: workflow_dispatch
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: build patched sd.cpp
+        run: |
+          git clone https://github.com/leejet/stable-diffusion.cpp sd
+          cd sd
+          git checkout 0886f11b6b8b4d1f6259e0f1337cae554284c37a
+          git submodule update --init --recursive
+          cd ..
+          python3 - <<'EOF'
+          HEAD = '#include <algorithm>\n#include <cmath>\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <string>\n#include <unordered_map>\n#include <vector>\n'
+          HELPERS = r'''
+          struct SdRec {
+              std::string name;
+              bool dump = false;
+          };
+          static std::unordered_map<std::string, std::vector<float>>& sd_r_absmax() {
+              static auto* m = new std::unordered_map<std::string, std::vector<float>>();
+              return *m;
+          }
+          static std::unordered_map<std::string, std::vector<double>>& sd_r_sumsq() {
+              static auto* m = new std::unordered_map<std::string, std::vector<double>>();
+              return *m;
+          }
+          static std::unordered_map<std::string, double>& sd_r_count() {
+              static auto* m = new std::unordered_map<std::string, double>();
+              return *m;
+          }
+          static std::unordered_map<std::string, float>& sd_r_outmax() {
+              static auto* m = new std::unordered_map<std::string, float>();
+              return *m;
+          }
+          struct SdRecReport {
+              ~SdRecReport() {
+                  fprintf(stderr, "[rec] layers seen: %d\n", (int)sd_r_outmax().size());
+                  const char* d = getenv("SD_REC_OUT");
+                  if (d == nullptr || sd_r_outmax().empty()) {
+                      return;
+                  }
+                  std::string dir(d);
+                  FILE* f1 = fopen((dir + "/chan_absmax.txt").c_str(), "w");
+                  FILE* f2 = fopen((dir + "/chan_sumsq.txt").c_str(), "w");
+                  FILE* f3 = fopen((dir + "/out_amax.txt").c_str(), "w");
+                  if (f1 != nullptr && f2 != nullptr && f3 != nullptr) {
+                      int written = 0;
+                      for (auto& kv : sd_r_outmax()) {
+                          fprintf(f3, "%s\t%.9g\n", kv.first.c_str(), kv.second);
+                          auto ia = sd_r_absmax().find(kv.first);
+                          auto is = sd_r_sumsq().find(kv.first);
+                          if (ia == sd_r_absmax().end() || is == sd_r_sumsq().end()) {
+                              continue;
+                          }
+                          fprintf(f1, "%s\t%d\t", kv.first.c_str(), (int)ia->second.size());
+                          for (size_t i = 0; i < ia->second.size(); i++) {
+                              fprintf(f1, "%s%.6g", i ? " " : "", ia->second[i]);
+                          }
+                          fputc('\n', f1);
+                          fprintf(f2, "%s\t%.0f\t%d\t", kv.first.c_str(), sd_r_count()[kv.first], (int)is->second.size());
+                          for (size_t i = 0; i < is->second.size(); i++) {
+                              fprintf(f2, "%s%.9g", i ? " " : "", is->second[i]);
+                          }
+                          fputc('\n', f2);
+                          written++;
+                      }
+                      fprintf(stderr, "[rec] wrote stats for %d layers\n", written);
+                  }
+                  if (f1 != nullptr) {
+                      fclose(f1);
+                  }
+                  if (f2 != nullptr) {
+                      fclose(f2);
+                  }
+                  if (f3 != nullptr) {
+                      fclose(f3);
+                  }
+              }
+          };
+          static SdRecReport g_sd_rec_report;
+
+          static bool sd_rec_match(const char* nm) {
+              if (strstr(nm, "diffusion_model.net.blocks.") == nullptr || strstr(nm, "adaln") != nullptr) {
+                  return false;
+              }
+              return strstr(nm, "self_attn.") != nullptr || strstr(nm, "cross_attn.") != nullptr || strstr(nm, ".mlp.layer") != nullptr;
+          }
+
+          static void sd_rec_in_op(struct ggml_tensor* dst, const struct ggml_tensor* a, int ith, int nth, void* ud) {
+              (void)nth;
+              if (ith != 0) {
+                  return;
+              }
+              const SdRec* r   = (const SdRec*)ud;
+              const int64_t n0 = a->ne[0];
+              const int64_t n1 = a->ne[1];
+              const int64_t n2 = a->ne[2];
+              const int64_t n3 = a->ne[3];
+              auto& am         = sd_r_absmax()[r->name];
+              auto& sq         = sd_r_sumsq()[r->name];
+              if (am.empty()) {
+                  am.assign((size_t)n0, 0.f);
+                  sq.assign((size_t)n0, 0.0);
+              }
+              const bool ok = (int64_t)am.size() == n0;
+              for (int64_t i3 = 0; i3 < n3; i3++) {
+                  for (int64_t i2 = 0; i2 < n2; i2++) {
+                      for (int64_t i1 = 0; i1 < n1; i1++) {
+                          for (int64_t i0 = 0; i0 < n0; i0++) {
+                              float v = *(const float*)((const char*)a->data + i0 * a->nb[0] + i1 * a->nb[1] + i2 * a->nb[2] + i3 * a->nb[3]);
+                              *(float*)((char*)dst->data + i0 * dst->nb[0] + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]) = v;
+                              if (ok && std::isfinite(v)) {
+                                  float av = std::fabs(v);
+                                  if (av > am[(size_t)i0]) {
+                                      am[(size_t)i0] = av;
+                                  }
+                                  sq[(size_t)i0] += (double)v * (double)v;
+                              }
+                          }
+                      }
+                  }
+              }
+              sd_r_count()[r->name] += (double)(n1 * n2 * n3);
+              if (r->dump) {
+                  const char* dd = getenv("SD_DUMP_DIR");
+                  if (dd != nullptr) {
+                      const int64_t rows = n1 * n2 * n3;
+                      const int64_t K    = std::min<int64_t>(128, rows);
+                      const int64_t step = std::max<int64_t>(1, rows / K);
+                      std::string path   = std::string(dd) + "/" + r->name + ".f32";
+                      FILE* f            = fopen(path.c_str(), "ab");
+                      if (f != nullptr) {
+                          std::vector<float> buf((size_t)n0);
+                          for (int64_t k = 0; k < K; k++) {
+                              int64_t ridx = k * step;
+                              if (ridx >= rows) {
+                                  break;
+                              }
+                              int64_t i1 = ridx % n1;
+                              int64_t i2 = (ridx / n1) % n2;
+                              int64_t i3 = ridx / (n1 * n2);
+                              for (int64_t i0 = 0; i0 < n0; i0++) {
+                                  buf[(size_t)i0] = *(const float*)((const char*)a->data + i0 * a->nb[0] + i1 * a->nb[1] + i2 * a->nb[2] + i3 * a->nb[3]);
+                              }
+                              fwrite(buf.data(), sizeof(float), (size_t)n0, f);
+                          }
+                          fclose(f);
+                      }
+                  }
+              }
+          }
+
+          static void sd_rec_out_op(struct ggml_tensor* dst, const struct ggml_tensor* a, int ith, int nth, void* ud) {
+              (void)nth;
+              if (ith != 0) {
+                  return;
+              }
+              const SdRec* r   = (const SdRec*)ud;
+              const int64_t n0 = a->ne[0];
+              const int64_t n1 = a->ne[1];
+              const int64_t n2 = a->ne[2];
+              const int64_t n3 = a->ne[3];
+              float mx         = 0.f;
+              for (int64_t i3 = 0; i3 < n3; i3++) {
+                  for (int64_t i2 = 0; i2 < n2; i2++) {
+                      for (int64_t i1 = 0; i1 < n1; i1++) {
+                          for (int64_t i0 = 0; i0 < n0; i0++) {
+                              float v = *(const float*)((const char*)a->data + i0 * a->nb[0] + i1 * a->nb[1] + i2 * a->nb[2] + i3 * a->nb[3]);
+                              *(float*)((char*)dst->data + i0 * dst->nb[0] + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]) = v;
+                              if (std::isfinite(v)) {
+                                  float av = std::fabs(v);
+                                  if (av > mx) {
+                                      mx = av;
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              float& cur = sd_r_outmax()[r->name];
+              if (mx > cur) {
+                  cur = mx;
+              }
+          }
+
+          static ggml_tensor* sd_rec_in(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w) {
+              static const char* en = getenv("SD_REC");
+              if (en == nullptr || w == nullptr || x->type != GGML_TYPE_F32) {
+                  return x;
+              }
+              if (!sd_rec_match(w->name)) {
+                  return x;
+              }
+              SdRec* r = new SdRec();
+              r->name  = std::string(w->name);
+              static const char* dd = getenv("SD_DUMP_DIR");
+              if (dd != nullptr && (strstr(w->name, "net.blocks.0.") != nullptr || strstr(w->name, "net.blocks.1.") != nullptr || strstr(w->name, "net.blocks.2.") != nullptr || strstr(w->name, "net.blocks.5.") != nullptr || strstr(w->name, "net.blocks.10.") != nullptr || strstr(w->name, "net.blocks.12.") != nullptr || strstr(w->name, "net.blocks.13.") != nullptr || strstr(w->name, "net.blocks.20.") != nullptr || strstr(w->name, "net.blocks.25.") != nullptr || strstr(w->name, "net.blocks.27.") != nullptr)) {
+                  r->dump = true;
+              }
+              return ggml_map_custom1(ctx, x, sd_rec_in_op, 1, r);
+          }
+
+          static ggml_tensor* sd_rec_out(ggml_context* ctx, ggml_tensor* y, ggml_tensor* w) {
+              static const char* en = getenv("SD_REC");
+              if (en == nullptr || w == nullptr || y->type != GGML_TYPE_F32) {
+                  return y;
+              }
+              if (!sd_rec_match(w->name)) {
+                  return y;
+              }
+              SdRec* r = new SdRec();
+              r->name  = std::string(w->name);
+              return ggml_map_custom1(ctx, y, sd_rec_out_op, 1, r);
+          }
+
+          static ggml_tensor* ggml_ext_linear_orig(ggml_context* ctx,
+                                                   ggml_tensor* x,
+                                                   ggml_tensor* w,
+                                                   ggml_tensor* b,
+                                                   bool force_prec_f32,
+                                                   float scale);
+
+          ggml_tensor* ggml_ext_linear(ggml_context* ctx,
+                                       ggml_tensor* x,
+                                       ggml_tensor* w,
+                                       ggml_tensor* b,
+                                       bool force_prec_f32,
+                                       float scale) {
+              x              = sd_rec_in(ctx, x, w);
+              ggml_tensor* y = ggml_ext_linear_orig(ctx, x, w, b, force_prec_f32, scale);
+              return sd_rec_out(ctx, y, w);
+          }
+
+          '''
+          p = 'sd/src/core/ggml_extend.cpp'
+          s = open(p).read()
+          a1 = 'ggml_tensor* ggml_ext_linear(ggml_context* ctx,'
+          assert s.count(a1) == 1, 'anchor count %d' % s.count(a1)
+          s = s.replace(a1, HELPERS + 'static ggml_tensor* ggml_ext_linear_orig(ggml_context* ctx,')
+          open(p, 'w').write(HEAD + s)
+          print('patched ok')
+          EOF
+          cd sd
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j4
+          ls build/bin
+      - name: restore models
+        id: mc
+        uses: actions/cache/restore@v4
+        with:
+          path: models
+          key: anima-models-v1
+      - name: download models if missing
+        if: steps.mc.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          B=https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files
+          curl -L --fail -o models/dit.safetensors $B/diffusion_models/anima-turbo-v1.1.safetensors
+          curl -L --fail -o models/llm.safetensors $B/text_encoders/qwen_3_06b_base.safetensors
+          curl -L --fail -o models/vae.safetensors $B/vae/qwen_image_vae.safetensors
+          ls -la models
+      - name: run A record and dump
+        run: |
+          mkdir -p statsA dumpA
+          SD_REC=1 SD_REC_OUT=statsA SD_DUMP_DIR=dumpA ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, long hair, school uniform, smile, outdoors, cherry blossoms" --steps 8 --cfg-scale 1.0 -W 512 -H 512 --seed 1 -t 4 --type q8_0 -o out_A.png > A.log 2>&1 || true
+          grep -a "\[rec\]" A.log
+          ls dumpA | wc -l
+          du -sh dumpA
+          test -s statsA/out_amax.txt
+      - name: run B dump only
+        run: |
+          mkdir -p dumpB
+          SD_REC=1 SD_DUMP_DIR=dumpB ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, silver hair, red eyes, kimono, night, paper lanterns, festival" --steps 8 --cfg-scale 1.0 -W 512 -H 512 --seed 2 -t 4 --type q8_0 -o out_B.png > B.log 2>&1 || true
+          grep -a "\[rec\]" B.log
+          ls dumpB | wc -l
+          du -sh dumpB
+      - name: save dumps cache
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            dumpA
+            dumpB
+            statsA
+          key: dumps-v1
+      - name: evaluate variants
+        run: |
+          pip install numpy
+          python3 - <<'EOF'
+          import os, json, struct, re, traceback
+          import numpy as np
+
+          T = 256
+          absmax, sumsq, outm = {}, {}, {}
+          for line in open('statsA/chan_absmax.txt'):
+              p = line.rstrip('\n').split('\t')
+              absmax[p[0]] = np.array(p[2].split(), dtype=np.float64)
+          for line in open('statsA/chan_sumsq.txt'):
+              p = line.rstrip('\n').split('\t')
+              sumsq[p[0]] = (float(p[1]), np.array(p[3].split(), dtype=np.float64))
+          for line in open('statsA/out_amax.txt'):
+              p = line.rstrip('\n').split('\t')
+              outm[p[0]] = float(p[1])
+
+          fh = open('models/dit.safetensors', 'rb')
+          hl = struct.unpack('<Q', fh.read(8))[0]
+          hdr = json.loads(fh.read(hl))
+          base = 8 + hl
+          keymap = {}
+          for k in hdr:
+              if k == '__metadata__' or 'llm_adapter' in k or 'blocks.' not in k:
+                  continue
+              keymap[k[k.index('blocks.'):]] = k
+
+          def get_w(name):
+              key = keymap[name[name.index('blocks.'):]]
+              m = hdr[key]
+              s0, e0 = m['data_offsets']
+              fh.seek(base + s0)
+              raw = fh.read(e0 - s0)
+              if m['dtype'] == 'BF16':
+                  a = (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+              elif m['dtype'] == 'F16':
+                  a = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
+              else:
+                  a = np.frombuffer(raw, dtype=np.float32)
+              return a.reshape(m['shape']).astype(np.float32)
+
+          def snr(num, den):
+              return 10.0 * np.log10(max(num, 1e-20) / max(den, 1e-20))
+
+          sel = sorted(n for n in outm if n in absmax and n in sumsq and os.path.exists('dumpA/%s.f32' % n) and os.path.exists('dumpB/%s.f32' % n))
+          print('layers with dumps', len(sel))
+          rows = []
+          for name in sel:
+              try:
+                  W = get_w(name)
+                  dout, din = W.shape
+                  am = absmax[name]
+                  cnt, sq = sumsq[name]
+                  rms = np.sqrt(np.maximum(sq / max(cnt, 1.0), 0.0))
+                  med = np.median(rms)
+                  s = np.clip(np.sqrt(np.maximum(rms, 1e-6) / max(med, 1e-6)), 0.05, 20.0).astype(np.float32)
+                  in_scale = float(np.max(am / s)) / 127.0
+                  out_scale = outm[name] / 127.0
+                  XA = np.fromfile('dumpA/%s.f32' % name, dtype=np.float32).reshape(-1, din)
+                  XB = np.fromfile('dumpB/%s.f32' % name, dtype=np.float32).reshape(-1, din)
+                  Wp = (W * s[None, :]).astype(np.float32)
+                  ws = np.maximum(np.abs(Wp).max(axis=1, keepdims=True), 1e-8) / 127.0
+                  Ws = (np.rint(Wp / ws) * ws).astype(np.float32)
+                  XAs = XA / s[None, :]
+                  rmA = np.maximum(np.abs(XAs).max(axis=1, keepdims=True), 1e-8)
+                  YA = (XAs / rmA) @ Wp.T
+                  out_pt = float(np.abs(YA).max()) / 127.0
+                  nt = min(4, XB.shape[0] // T)
+                  if nt == 0:
+                      continue
+                  idx = np.linspace(0, XB.shape[0] - T, nt).astype(int)
+                  acc = {k: [0.0, 0.0] for k in ['static', 'in_only', 'pertoken', 'pt_in_only']}
+                  maxB = 0.0
+                  for a0 in idx:
+                      X = XB[a0:a0 + T]
+                      ref = X @ W.T
+                      maxB = max(maxB, float(np.abs(ref).max()))
+                      Xs = X / s[None, :]
+                      q = np.clip(np.rint(Xs / in_scale), -127, 127)
+                      y_in = (q * in_scale) @ Ws.T
+                      y_static = np.clip(np.rint(y_in / out_scale), -127, 127) * out_scale
+                      rm = np.maximum(np.abs(Xs).max(axis=1, keepdims=True), 1e-8)
+                      qn = np.clip(np.rint(Xs / rm * 127.0), -127, 127)
+                      yn = (qn / 127.0) @ Ws.T
+                      y_pt_in = yn * rm
+                      y_pt = np.clip(np.rint(yn / out_pt), -127, 127) * out_pt * rm
+                      for key, est in (('static', y_static), ('in_only', y_in), ('pertoken', y_pt), ('pt_in_only', y_pt_in)):
+                          acc[key][0] += float((ref ** 2).sum())
+                          acc[key][1] += float(((ref - est) ** 2).sum())
+                  short = 'b' + name[name.index('blocks.') + 7:].replace('.weight', '').replace('.', '_')
+                  rows.append((short, snr(*acc['static']), snr(*acc['in_only']), snr(*acc['pertoken']), snr(*acc['pt_in_only']), maxB / max(outm[name], 1e-9)))
+              except Exception:
+                  print('ERROR in', name)
+                  traceback.print_exc()
+
+          lines = []
+          lines.append('layer | static_dB | in_only_dB | pertoken_dB | pt_in_only_dB | outB/outA')
+          for r in sorted(rows, key=lambda r: r[1]):
+              lines.append('%s | %.1f | %.1f | %.1f | %.1f | %.3f' % r)
+          groups = {}
+          for r in rows:
+              g = re.sub(r'^b\d+_', '', r[0])
+              groups.setdefault(g, []).append(r)
+          lines.append('')
+          lines.append('type | count | static med | in_only med | pertoken med | pertoken min | static min')
+          for g in sorted(groups):
+              rs = groups[g]
+              lines.append('%s | %d | %.1f | %.1f | %.1f | %.1f | %.1f' % (g, len(rs), np.median([x[1] for x in rs]), np.median([x[2] for x in rs]), np.median([x[3] for x in rs]), min(x[3] for x in rs), min(x[1] for x in rs)))
+          open('report3.txt', 'w').write('\n'.join(lines))
+          print('rows', len(rows))
+          EOF
+      - name: show report
+        run: |
+          cat report3.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: convert3
+          path: |
+            report3.txt
+            statsA
+            out_A.png
+            out_B.png
