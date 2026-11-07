@@ -1,0 +1,19 @@
+name: cache-models
+on: workflow_dispatch
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - name: download
+        run: |
+          mkdir -p models
+          B=https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files
+          curl -L --fail -o models/dit.safetensors $B/diffusion_models/anima-turbo-v1.1.safetensors
+          curl -L --fail -o models/llm.safetensors $B/text_encoders/qwen_3_06b_base.safetensors
+          curl -L --fail -o models/vae.safetensors $B/vae/qwen_image_vae.safetensors
+          ls -la models
+      - name: save
+        uses: actions/cache/save@v4
+        with:
+          path: models
+          key: anima-models-v1
