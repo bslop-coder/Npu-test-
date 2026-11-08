@@ -1,0 +1,106 @@
+name: npu-sd3
+on: workflow_dispatch
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: check files
+        run: |
+          wc -l npu_a.inc npu_b.inc npu_c.inc
+          grep -q "END_NPU_A" npu_a.inc || { echo "npu_a.inc is incomplete"; exit 1; }
+          grep -q "END_NPU_B" npu_b.inc || { echo "npu_b.inc is incomplete"; exit 1; }
+          grep -q "END_NPU_C" npu_c.inc || { echo "npu_c.inc is incomplete"; exit 1; }
+      - name: build patched sd-cli for android
+        run: |
+          git clone https://github.com/leejet/stable-diffusion.cpp sd
+          cd sd
+          git checkout 0886f11b6b8b4d1f6259e0f1337cae554284c37a
+          git submodule update --init --recursive
+          cd ..
+          cp npu_a.inc npu_b.inc npu_c.inc sd/src/core/
+          python3 - <<'EOF'
+          import glob, re
+          HEAD = '#include <android/NeuralNetworks.h>\n#include <arm_neon.h>\n#include <fcntl.h>\n#include <sys/mman.h>\n#include <sys/stat.h>\n#include <unistd.h>\n#include <algorithm>\n#include <chrono>\n#include <cmath>\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <fstream>\n#include <string>\n#include <unordered_map>\n#include <vector>\n'
+          D = r'''
+          static bool g_sd_npu_off = false;
+
+          void sd_npu_release_all() {
+              if (g_sd_npu_off) {
+                  return;
+              }
+              g_sd_npu_off = true;
+              sd_log_mem("before release");
+              for (auto& kv : sd_npu_reg()) {
+                  SdNpuLayer* L = kv.second;
+                  if (L == nullptr) {
+                      continue;
+                  }
+                  if (L->comp != nullptr) {
+                      ANeuralNetworksCompilation_free(L->comp);
+                      L->comp = nullptr;
+                  }
+                  if (L->model != nullptr) {
+                      ANeuralNetworksModel_free(L->model);
+                      L->model = nullptr;
+                  }
+                  if (L->w != nullptr) {
+                      munmap((void*)L->w, L->wsize);
+                      L->w = nullptr;
+                  }
+              }
+              sd_log_mem("after release");
+              fprintf(stderr, "[npu] released\n");
+          }
+
+          '''
+          open('sd/src/core/npu_d.inc', 'w').write(D)
+          pc = 'sd/src/core/npu_c.inc'
+          c = open(pc).read()
+          a = 'static ggml_tensor* sd_npu_try(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, float scale) {'
+          assert c.count(a) == 1, 'try anchor %d' % c.count(a)
+          c = c.replace(a, a + '\n    if (g_sd_npu_off) {\n        return nullptr;\n    }')
+          b = '    g_sd_npu_stats.calls++;\n}'
+          assert c.count(b) == 1, 'calls anchor %d' % c.count(b)
+          c = c.replace(b, r'''    g_sd_npu_stats.calls++;
+              if (g_sd_npu_stats.calls % 280 == 0) {
+                  fprintf(stderr, "[npu] step stats calls %ld tiles %ld npu_ms %.0f prep_ms %.0f\n", g_sd_npu_stats.calls, g_sd_npu_stats.tiles, g_sd_npu_stats.npu_ms, g_sd_npu_stats.prep_ms);
+              }
+          }''')
+          open(pc, 'w').write(c)
+          paths = glob.glob('sd/src/**/image.cpp', recursive=True)
+          assert len(paths) == 1, paths
+          pi = paths[0]
+          t = open(pi).read()
+          m = re.search(r'^[ \t]*LOG_INFO\("decoding [^\n]*$', t, re.M)
+          assert m is not None, 'decoding log line not found'
+          indent = re.match(r'[ \t]*', m.group(0)).group(0)
+          t = t[:m.start()] + indent + 'sd_npu_release_all();\n' + t[m.start():]
+          t = 'void sd_npu_release_all();\n' + t
+          open(pi, 'w').write(t)
+          print('patched image.cpp', pi)
+          p = 'sd/src/core/ggml_extend.cpp'
+          s = open(p).read()
+          a1 = 'ggml_tensor* ggml_ext_linear(ggml_context* ctx,'
+          assert s.count(a1) == 1, 'anchor count %d' % s.count(a1)
+          inc = '#include "npu_a.inc"\n#include "npu_b.inc"\n#include "npu_d.inc"\n#include "npu_c.inc"\n'
+          s = s.replace(a1, inc + 'static ggml_tensor* ggml_ext_linear_orig(ggml_context* ctx,')
+          open(p, 'w').write(HEAD + s)
+          print('patched ok')
+          EOF
+          cd sd
+          NDK=${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}
+          echo NDK $NDK
+          cmake -B build -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 -DGGML_OPENMP=OFF "-DCMAKE_CXX_STANDARD_LIBRARIES=-lneuralnetworks"
+          cmake --build build --config Release -j4
+          ls -la build/bin
+      - name: bundle
+        run: |
+          mkdir -p out
+          cp sd/build/bin/sd-cli out/
+          du -sh out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npu-sd3
+          path: out
