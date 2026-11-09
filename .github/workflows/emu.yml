@@ -1,0 +1,175 @@
+name: emu
+on: workflow_dispatch
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: check file
+        run: |
+          wc -l emu.inc
+          grep -q "END_EMU" emu.inc || { echo "emu.inc is incomplete"; exit 1; }
+      - name: restore models
+        uses: actions/cache/restore@v4
+        with:
+          path: models
+          key: anima-models-v1
+          fail-on-cache-miss: true
+      - name: restore dumps
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            dumpA
+            dumpB
+            statsA
+          key: dumps-v1
+          fail-on-cache-miss: true
+      - name: build pack
+        run: |
+          pip install numpy
+          python3 - <<'EOF'
+          import os, json, struct
+          import numpy as np
+
+          T = 256
+          absmax, sumsq, outm = {}, {}, {}
+          for line in open('statsA/chan_absmax.txt'):
+              p = line.rstrip('\n').split('\t')
+              absmax[p[0]] = np.array(p[2].split(), dtype=np.float64)
+          for line in open('statsA/chan_sumsq.txt'):
+              p = line.rstrip('\n').split('\t')
+              sumsq[p[0]] = (float(p[1]), np.array(p[3].split(), dtype=np.float64))
+          for line in open('statsA/out_amax.txt'):
+              p = line.rstrip('\n').split('\t')
+              outm[p[0]] = float(p[1])
+
+          fh = open('models/dit.safetensors', 'rb')
+          hl = struct.unpack('<Q', fh.read(8))[0]
+          hdr = json.loads(fh.read(hl))
+          base = 8 + hl
+          keymap = {}
+          for k in hdr:
+              if k == '__metadata__' or 'llm_adapter' in k or 'blocks.' not in k:
+                  continue
+              keymap[k[k.index('blocks.'):]] = k
+
+          def get_w(name):
+              key = keymap[name[name.index('blocks.'):]]
+              m = hdr[key]
+              s0, e0 = m['data_offsets']
+              fh.seek(base + s0)
+              raw = fh.read(e0 - s0)
+              if m['dtype'] == 'BF16':
+                  a = (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+              elif m['dtype'] == 'F16':
+                  a = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
+              else:
+                  a = np.frombuffer(raw, dtype=np.float32)
+              return a.reshape(m['shape']).astype(np.float32)
+
+          os.makedirs('pack', exist_ok=True)
+          count = 0
+          for name in sorted(n for n in outm if n in absmax and n in sumsq and 'net.blocks.' in n):
+              b = int(name.split('net.blocks.')[1].split('.')[0])
+              short = 'b%d_%s' % (b, name.split('blocks.%d.' % b)[1].replace('.weight', '').replace('.', '_'))
+              W = get_w(name)
+              dout, din = W.shape
+              am = absmax[name]
+              cnt, sq = sumsq[name]
+              rms = np.sqrt(np.maximum(sq / max(cnt, 1.0), 0.0))
+              med = np.median(rms)
+              s = np.clip(np.sqrt(np.maximum(rms, 1e-6) / max(med, 1e-6)), 0.05, 20.0).astype(np.float32)
+              in_scale = float(np.max(am / s)) / 127.0
+              out_scale = outm[name] / 127.0
+              Wp = (W * s[None, :]).astype(np.float32)
+              ws = np.maximum(np.abs(Wp).max(axis=1), 1e-8) / 127.0
+              qW = np.clip(np.rint(Wp / ws[:, None]), -127, 127).astype(np.int8)
+              open('pack/%s.meta' % short, 'w').write('%d %d %d %.9g %.9g\n' % (din, dout, T, in_scale, out_scale))
+              qW.tofile('pack/%s.w' % short)
+              ws.astype(np.float32).tofile('pack/%s.ws' % short)
+              s.tofile('pack/%s.s' % short)
+              count += 1
+          print('layers packed', count)
+          EOF
+          du -sh pack
+      - name: build x86 sd-cli with emulation
+        run: |
+          git clone https://github.com/leejet/stable-diffusion.cpp sd
+          cd sd
+          git checkout 0886f11b6b8b4d1f6259e0f1337cae554284c37a
+          git submodule update --init --recursive
+          cd ..
+          cp emu.inc sd/src/core/
+          python3 - <<'EOF'
+          HEAD = '#include <algorithm>\n#include <cmath>\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <fstream>\n#include <functional>\n#include <string>\n#include <thread>\n#include <unordered_map>\n#include <vector>\n'
+          p = 'sd/src/core/ggml_extend.cpp'
+          s = open(p).read()
+          a1 = 'ggml_tensor* ggml_ext_linear(ggml_context* ctx,'
+          assert s.count(a1) == 1, 'anchor count %d' % s.count(a1)
+          s = s.replace(a1, '#include "emu.inc"\nstatic ggml_tensor* ggml_ext_linear_orig(ggml_context* ctx,')
+          open(p, 'w').write(HEAD + s)
+          print('patched ok')
+          EOF
+          cd sd
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j4
+          ls build/bin
+      - name: cpu q8 reference
+        run: |
+          ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, long hair, school uniform, smile, outdoors, cherry blossoms" --steps 3 --cfg-scale 1.0 -W 256 -H 256 --seed 1 -t 4 --type q8_0 -o cpu_q8.png > cpu_q8.log 2>&1 || true
+          tail -n 3 cpu_q8.log
+          test -f cpu_q8.png
+      - name: emu q8 all layers
+        run: |
+          SD_EMU_PACK=pack ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, long hair, school uniform, smile, outdoors, cherry blossoms" --steps 3 --cfg-scale 1.0 -W 256 -H 256 --seed 1 -t 4 --type q8_0 -o emu_q8.png > emu_q8.log 2>&1 || true
+          grep -a "\[emu\]" emu_q8.log
+          tail -n 3 emu_q8.log
+          test -f emu_q8.png
+      - name: emu q8 skip block 12
+        run: |
+          SD_EMU_PACK=pack SD_EMU_SKIP=12 ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, long hair, school uniform, smile, outdoors, cherry blossoms" --steps 3 --cfg-scale 1.0 -W 256 -H 256 --seed 1 -t 4 --type q8_0 -o emu_q8_skip12.png > emu_q8_skip12.log 2>&1 || true
+          grep -a "\[emu\]" emu_q8_skip12.log
+          test -f emu_q8_skip12.png
+      - name: cpu q4
+        run: |
+          ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, long hair, school uniform, smile, outdoors, cherry blossoms" --steps 3 --cfg-scale 1.0 -W 256 -H 256 --seed 1 -t 4 --type q4_0 -o cpu_q4.png > cpu_q4.log 2>&1 || true
+          test -f cpu_q4.png
+      - name: emu q4 all layers
+        run: |
+          SD_EMU_PACK=pack ./sd/build/bin/sd-cli --diffusion-model models/dit.safetensors --vae models/vae.safetensors --llm models/llm.safetensors -p "masterpiece, best quality, 1girl, long hair, school uniform, smile, outdoors, cherry blossoms" --steps 3 --cfg-scale 1.0 -W 256 -H 256 --seed 1 -t 4 --type q4_0 -o emu_q4.png > emu_q4.log 2>&1 || true
+          grep -a "\[emu\]" emu_q4.log
+          test -f emu_q4.png
+      - name: compare
+        run: |
+          pip install pillow numpy
+          python3 - <<'EOF'
+          from PIL import Image, ImageDraw
+          import numpy as np
+          names = ['cpu_q8', 'emu_q8', 'emu_q8_skip12', 'cpu_q4', 'emu_q4']
+          ref = np.asarray(Image.open('cpu_q8.png').convert('RGB')).astype(np.float32)
+          for n in names:
+              b = np.asarray(Image.open(n + '.png').convert('RGB')).astype(np.float32)
+              mse = ((ref - b) ** 2).mean()
+              print(n, 'PSNR vs cpu_q8 %.1f dB' % (10 * np.log10(255.0 ** 2 / max(mse, 1e-9))))
+          ims = [Image.open(n + '.png').convert('RGB') for n in names]
+          w, h = ims[0].size
+          m = Image.new('RGB', (w * len(ims), h + 20), (0, 0, 0))
+          d = ImageDraw.Draw(m)
+          for i, (n, im) in enumerate(zip(names, ims)):
+              m.paste(im, (i * w, 20))
+              d.text((i * w + 4, 4), n, fill=(255, 255, 255))
+          m.save('montage_emu.png')
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: emu
+          path: |
+            montage_emu.png
+            cpu_q8.png
+            emu_q8.png
+            emu_q8_skip12.png
+            cpu_q4.png
+            emu_q4.png
+            emu_q8.log
